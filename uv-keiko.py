@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 UV Keiko - Smart Dependency Updater
 
@@ -11,13 +12,12 @@ Prerequisites:
 - packaging: pip install packaging
 
 Usage:
-python uv-keiko.py [--dry-run] [--no-backup] [--pyproject PATH]
+python keiko.py [--dry-run] [--no-backup] [--pyproject PATH]
 """
 
 import argparse
 import re
 import shutil
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -54,16 +54,19 @@ class PackageUpdater:
 
     def get_package_info(self, package_name: str) -> Optional[dict]:
         """Fetches package information from PyPI"""
-        if package_name in self.package_cache:
-            return self.package_cache[package_name]
+        # Normalize package name for PyPI (lowercase, underscores to hyphens)
+        normalized_name = package_name.lower().replace('_', '-')
+
+        if normalized_name in self.package_cache:
+            return self.package_cache[normalized_name]
 
         try:
-            url = f"https://pypi.org/pypi/{package_name}/json"
-            response = self.session.get(url, timeout=10)
+            url = f"https://pypi.org/pypi/{normalized_name}/json"
+            response = self.session.get(url, timeout=15)
             response.raise_for_status()
 
             data = response.json()
-            self.package_cache[package_name] = data
+            self.package_cache[normalized_name] = data
             return data
 
         except requests.RequestException as e:
@@ -71,141 +74,106 @@ class PackageUpdater:
             return None
 
     def get_latest_version(self, package_name: str) -> Optional[str]:
-        """Determines the latest version of a package"""
+        """Gets the latest stable version of a package from PyPI"""
         info = self.get_package_info(package_name)
         if not info:
             return None
 
-        return info['info']['version']
+        # Get the latest version from PyPI
+        latest = info['info']['version']
+        print(f"  📡 PyPI latest for {package_name}: {latest}")
+        return latest
 
-    def get_compatible_versions(self, package_name: str, python_version: str = None) -> List[str]:
-        """Determines all compatible versions of a package"""
-        info = self.get_package_info(package_name)
-        if not info:
-            return []
-
-        versions = []
-        for ver, releases in info['releases'].items():
-            if releases:  # Only versions with actual releases
-                try:
-                    version.parse(ver)  # Validate version number
-                    versions.append(ver)
-                except version.InvalidVersion:
-                    continue
-
-        # Sort versions in descending order
-        versions.sort(key=version.parse, reverse=True)
-        return versions
-
-    def parse_requirement(self, req_string: str) -> Tuple[str, str, Optional[str]]:
-        """Parses a requirement string and returns name, constraint, and extras"""
+    def parse_requirement(self, req_string: str) -> Tuple[str, str, str, str]:
+        """Parses a requirement string and returns original_name, normalized_name, constraint, extras"""
         try:
-            req = Requirement(req_string)
-            name = req.name.lower()
+            req = Requirement(req_string.strip())
+            original_name = req.name  # Keep original casing
+            normalized_name = req.name.lower()
 
             # Extract extras
-            extras = f"[{','.join(req.extras)}]" if req.extras else ""
+            extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
 
             # Extract current constraints
-            if req.specifier:
-                constraint = str(req.specifier)
-            else:
-                constraint = ""
+            constraint = str(req.specifier) if req.specifier else ""
 
-            return name, constraint, extras
+            return original_name, normalized_name, constraint, extras
+
         except Exception as e:
             print(f"⚠️  Warning: Could not parse requirement '{req_string}': {e}")
             # Fallback for simple names
-            match = re.match(r'^([a-zA-Z0-9_-]+)(\[.*\])?', req_string)
+            match = re.match(r'^([a-zA-Z0-9_-]+)(\[.*\])?', req_string.strip())
             if match:
-                name = match.group(1).lower()
+                name = match.group(1)
                 extras = match.group(2) or ""
-                return name, "", extras
-            return req_string.lower(), "", ""
+                return name, name.lower(), "", extras
+            return req_string.strip(), req_string.strip().lower(), "", ""
 
-    def check_uv_compatibility(self, dependencies: Dict[str, str]) -> bool:
-        """Checks the compatibility of dependencies with uv"""
-        if not shutil.which('uv'):
-            print("⚠️  uv is not installed. Install it for best compatibility checking.")
+    def update_dependency_list(self, dependencies: List[str], group_name: str = "main") -> Tuple[
+        List[str], List[str]]:
+        """Updates a list of dependencies to their latest versions"""
+        print(f"🔄 Updating {group_name} dependencies...")
+
+        new_dependencies = []
+        updated_packages = []
+
+        for dep in dependencies:
+            if not dep or not dep.strip():
+                continue
+
+            # Handle include-group entries (for dependency-groups)
+            if isinstance(dep, dict) and 'include-group' in dep:
+                new_dependencies.append(dep)
+                continue
+
+            # Parse the dependency
+            original_name, normalized_name, old_constraint, extras = self.parse_requirement(dep)
+
+            print(f"  📦 Processing: {original_name}")
+
+            # Get latest version from PyPI
+            latest_version = self.get_latest_version(normalized_name)
+
+            if latest_version:
+                # Build new dependency string with latest version
+                new_dep = f"{original_name}{extras}>={latest_version}"
+                new_dependencies.append(new_dep)
+
+                # Check if this is actually an update
+                old_version = self.extract_version_from_constraint(old_constraint)
+                if self.is_version_newer(latest_version, old_version):
+                    updated_packages.append(
+                        f"{original_name}: {old_version or 'unknown'} -> {latest_version}")
+                    print(f"    ✓ {original_name}: {old_version or 'unknown'} -> {latest_version}")
+                else:
+                    print(f"    ✓ {original_name}: already latest ({latest_version})")
+            else:
+                # Keep original if we couldn't get version info
+                new_dependencies.append(dep)
+                print(f"    ⚠️  {original_name}: Could not fetch version, keeping original")
+
+        return new_dependencies, updated_packages
+
+    def extract_version_from_constraint(self, constraint: str) -> Optional[str]:
+        """Extracts version number from a constraint string like '>=1.2.3'"""
+        if not constraint:
+            return None
+
+        # Handle common patterns: >=1.2.3, ==1.2.3, ~=1.2.3, etc.
+        match = re.search(r'[><=~!]*\s*([0-9]+(?:\.[0-9]+)*(?:\.[0-9a-zA-Z-]+)*)', constraint)
+        if match:
+            return match.group(1)
+        return None
+
+    def is_version_newer(self, new_version: str, old_version: Optional[str]) -> bool:
+        """Checks if new_version is newer than old_version"""
+        if not old_version:
             return True
 
         try:
-            # Create temporary pyproject.toml for testing
-            temp_project = {
-                'project': {
-                    'name': 'temp-compatibility-test',
-                    'version': '0.1.0',
-                    'requires-python': '>=3.8',
-                    'dependencies': [f"{name}>={ver}" for name, ver in dependencies.items()]
-                }
-            }
-
-            temp_path = Path('temp_pyproject.toml')
-            with open(temp_path, 'wb') as f:
-                tomli_w.dump(temp_project, f)
-
-            # Test with uv lock --dry-run (if available)
-            result = subprocess.run(
-                ['uv', 'lock', '--dry-run', '--project', str(temp_path.parent)],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            temp_path.unlink()  # Cleanup
-
-            if result.returncode == 0:
-                return True
-            else:
-                print(f"⚠️  uv compatibility check failed: {result.stderr}")
-                return False
-
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-            return True  # Assume compatible if we can't test
-
-    def resolve_dependencies(self, requirements: List[str]) -> Dict[str, str]:
-        """Resolves dependencies and finds the latest compatible versions"""
-        print("🔍 Analyzing dependencies...")
-
-        resolved = {}
-        processed = set()
-
-        def process_requirement(req_string: str, depth: int = 0) -> None:
-            if depth > 10:  # Prevent infinite recursion
-                return
-
-            name, constraint, extras = self.parse_requirement(req_string)
-
-            if name in processed:
-                return
-
-            processed.add(name)
-            print(f"{'  ' * depth}📦 Processing: {name}")
-
-            # Get latest version
-            latest_version = self.get_latest_version(name)
-            if not latest_version:
-                print(f"{'  ' * depth}⚠️  Could not determine version for {name}")
-                return
-
-            resolved[name] = latest_version
-            print(f"{'  ' * depth}✓ {name}: {latest_version}")
-
-            # Get dependencies of the latest version
-            info = self.get_package_info(name)
-            if info and 'info' in info and 'requires_dist' in info['info']:
-                requires_dist = info['info']['requires_dist'] or []
-                for dep in requires_dist:
-                    if ';' in dep:  # Remove environment markers
-                        dep = dep.split(';')[0].strip()
-                    if dep and not any(extra in dep for extra in ['extra ==', 'extra==']):
-                        process_requirement(dep, depth + 1)
-
-        # Process all requirements
-        for req in requirements:
-            process_requirement(req)
-
-        return resolved
+            return version.parse(new_version) > version.parse(old_version)
+        except version.InvalidVersion:
+            return True  # Assume it's newer if we can't parse
 
     def update_pyproject(self) -> None:
         """Updates the pyproject.toml with the latest versions"""
@@ -219,103 +187,57 @@ class PackageUpdater:
         with open(self.pyproject_path, 'rb') as f:
             data = tomllib.load(f)
 
-        original_data = data.copy()
-        updated_packages = []
+        all_updated_packages = []
 
         # Update main dependencies
         if 'project' in data and 'dependencies' in data['project']:
-            print("\n🔄 Updating main dependencies...")
             dependencies = data['project']['dependencies']
-
-            # Resolve all dependencies
-            resolved = self.resolve_dependencies(dependencies)
-
-            # Update dependencies
-            new_dependencies = []
-            for dep in dependencies:
-                name, _, extras = self.parse_requirement(dep)
-
-                if name in resolved:
-                    new_version = resolved[name]
-                    new_dep = f"{name}{extras}>={new_version}"
-                    new_dependencies.append(new_dep)
-
-                    if not dep.startswith(f"{name}{extras}>={new_version}"):
-                        updated_packages.append(f"{name}: -> {new_version}")
-                        print(f"  ✓ {name}: -> {new_version}")
-                else:
-                    new_dependencies.append(dep)
-                    print(f"  ⚠️  {name}: No update available")
-
-            data['project']['dependencies'] = new_dependencies
+            if dependencies:
+                new_deps, updated = self.update_dependency_list(dependencies, "main")
+                data['project']['dependencies'] = new_deps
+                all_updated_packages.extend(updated)
 
         # Update optional dependencies
         if 'project' in data and 'optional-dependencies' in data['project']:
-            print("\n🔄 Updating optional dependencies...")
+            print(f"\n🔄 Updating optional dependencies...")
 
             for group_name, deps in data['project']['optional-dependencies'].items():
-                print(f"  Group: {group_name}")
-                resolved = self.resolve_dependencies(deps)
-
-                new_deps = []
-                for dep in deps:
-                    name, _, extras = self.parse_requirement(dep)
-
-                    if name in resolved:
-                        new_version = resolved[name]
-                        new_dep = f"{name}{extras}>={new_version}"
-                        new_deps.append(new_dep)
-
-                        if not dep.startswith(f"{name}{extras}>={new_version}"):
-                            updated_packages.append(f"{name} ({group_name}): -> {new_version}")
-                            print(f"    ✓ {name}: -> {new_version}")
-                    else:
-                        new_deps.append(dep)
-                        print(f"    ⚠️  {name}: No update available")
-
-                data['project']['optional-dependencies'][group_name] = new_deps
+                if deps:
+                    print(f"  Group: {group_name}")
+                    new_deps, updated = self.update_dependency_list(deps, f"optional[{group_name}]")
+                    data['project']['optional-dependencies'][group_name] = new_deps
+                    all_updated_packages.extend(updated)
 
         # Update dependency groups (PEP 735)
         if 'dependency-groups' in data:
-            print("\n🔄 Updating dependency groups...")
+            print(f"\n🔄 Updating dependency groups...")
 
             for group_name, deps in data['dependency-groups'].items():
-                print(f"  Group: {group_name}")
+                if deps:
+                    print(f"  Group: {group_name}")
+                    # Filter out include-group entries and process only regular dependencies
+                    regular_deps = [d for d in deps if
+                                    not (isinstance(d, dict) and 'include-group' in d)]
+                    include_groups = [d for d in deps if
+                                      isinstance(d, dict) and 'include-group' in d]
 
-                # Filter include-group entries
-                regular_deps = [d for d in deps if
-                                not (isinstance(d, dict) and 'include-group' in d)]
-                include_groups = [d for d in deps if isinstance(d, dict) and 'include-group' in d]
-
-                if regular_deps:
-                    resolved = self.resolve_dependencies(regular_deps)
-
-                    new_deps = []
-                    for dep in regular_deps:
-                        name, _, extras = self.parse_requirement(dep)
-
-                        if name in resolved:
-                            new_version = resolved[name]
-                            new_dep = f"{name}{extras}>={new_version}"
-                            new_deps.append(new_dep)
-
-                            if not dep.startswith(f"{name}{extras}>={new_version}"):
-                                updated_packages.append(f"{name} ({group_name}): -> {new_version}")
-                                print(f"    ✓ {name}: -> {new_version}")
-                        else:
-                            new_deps.append(dep)
-                            print(f"    ⚠️  {name}: No update available")
-
-                    # Combine new deps with include-groups
-                    data['dependency-groups'][group_name] = new_deps + include_groups
+                    if regular_deps:
+                        new_deps, updated = self.update_dependency_list(regular_deps,
+                                                                        f"group[{group_name}]")
+                        # Combine updated deps with include-groups
+                        data['dependency-groups'][group_name] = new_deps + include_groups
+                        all_updated_packages.extend(updated)
+                    else:
+                        # Only include-groups, keep as is
+                        data['dependency-groups'][group_name] = deps
 
         # Display results
         print(f"\n📊 Summary:")
-        print(f"  📦 Total {len(updated_packages)} packages updated")
+        print(f"  📦 Total {len(all_updated_packages)} packages updated")
 
-        if updated_packages:
+        if all_updated_packages:
             print("  🔄 Updated packages:")
-            for pkg in updated_packages:
+            for pkg in all_updated_packages:
                 print(f"    • {pkg}")
 
         # Write file or dry-run
@@ -323,7 +245,7 @@ class PackageUpdater:
             print(f"\n🔍 DRY RUN: Changes would be written to {self.pyproject_path}")
             print("   Use without --dry-run to actually write changes")
         else:
-            if updated_packages:
+            if all_updated_packages:
                 self.create_backup()
 
                 with open(self.pyproject_path, 'wb') as f:
@@ -375,6 +297,8 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
