@@ -32,7 +32,7 @@ UV Keiko is a smart dependency updater for Python projects using [UV](https://gi
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/uv-keiko.git
+git clone https://github.com/oscharko/uv-keiko
 cd uv-keiko
 
 # Install dependencies
